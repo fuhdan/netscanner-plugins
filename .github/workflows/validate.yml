@@ -21,6 +21,12 @@ jobs:
       - name: Scan plugins for security issues
         run: bandit -r plugins/ -ll
 
+      - name: Install ruff
+        run: pip install ruff -q
+
+      - name: Lint plugins and tests
+        run: ruff check plugins/ tests/
+
   test:
     name: Test plugins (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

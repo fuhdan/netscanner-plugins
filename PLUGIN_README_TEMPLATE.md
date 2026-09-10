@@ -9,11 +9,10 @@ Brief explanation of the protocol — what it is, what devices use it, why scann
 
 ## Installation
 
-```bash
-# Clone or download this repo, then copy the plugin into your netscanner installation:
-cp plugins/yourprotocol.py /path/to/netscanner/plugins/
+None. Merged plugins are synced into netscanner, so a current netscanner
+checkout already has this plugin. Verify with:
 
-# Verify it is discovered:
+```bash
 python3 netscanner.py --list-protocols
 ```
 
@@ -65,4 +64,4 @@ does not handle, known false positives or negatives.
 
 ## Licence
 
-<!-- e.g. MIT -->
+Apache-2.0, as part of netscanner-plugins. Leave this section as it stands.

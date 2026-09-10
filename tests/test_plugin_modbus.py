@@ -18,9 +18,10 @@ from netscanner import (
     STATUS_CLOSED_IMMEDIATELY, STATUS_ZERO_WINDOW, STATUS_TIMEOUT_RESPONSE,
     STATUS_NO_PROTOCOL,
     scan_host, run_scan, format_result_line, format_summary, write_csv,
+    ProbeChannel,
 )
 from plugins.modbus import (
-    ModbusPlugin, STATUS_NO_MODBUS, STATUS_EXCEPTION,
+    ModbusPlugin, STATUS_NO_MODBUS,
     build_modbus_request, parse_modbus_response, _probe,
 )
 import plugins.modbus as _modbus_mod
@@ -200,53 +201,72 @@ def test_scan_config_defaults():
 # _probe
 # ---------------------------------------------------------------------------
 
-@patch("plugins.modbus.select.select")
-def test_probe_pcap_log_events(_mock_select):
-    sock = MagicMock()
-    _mock_select.side_effect = [([], [sock], []), ([sock], [], [])]
-    resp = _make_fc3_response(tid=1, uid=0)
-    sock.recv.return_value = resp
-    events = []
-    _probe(sock, unit_id=0, fc=3, response_timeout=3.0,
-           pcap_log=lambda d, ts, r: events.append((d, r)))
-    assert len(events) == 2
-    assert events[0][0] == 'send' and events[1][0] == 'recv'
-    assert events[1][1] == resp
+class _CollectingWriter:
+    """Stands in for a PcapWriter and keeps what it was asked to write."""
+
+    def __init__(self):
+        self.frames = []
+
+    def write_packet(self, ts, src_ip, dst_ip, src_port, dst_port, flags,
+                     seq, ack, payload=b""):
+        self.frames.append({"flags": flags, "payload": payload})
 
 
-@patch("plugins.modbus.select.select")
-def test_probe_pcap_log_send_is_valid_modbus(_mock_select):
+def _echoing_socket(mock_select):
+    """A socket that answers a Modbus request with the transaction id it carried."""
     sock = MagicMock()
-    _mock_select.side_effect = [([], [sock], []), ([sock], [], [])]
-    sock.recv.return_value = _make_fc3_response(tid=1, uid=0)
-    sent = []
-    _probe(sock, unit_id=0, fc=3, response_timeout=3.0,
-           pcap_log=lambda d, ts, r: sent.append(r) if d == 'send' else None)
-    assert len(sent) == 1
-    frame = sent[0]
+    sock.getsockname.return_value = ("10.0.0.250", 51000)
+    mock_select.side_effect = [([], [sock], []), ([sock], [], [])]
+    sent = {}
+    sock.sendall.side_effect = lambda payload: sent.__setitem__("frame", payload)
+    sock.recv.side_effect = lambda n: _make_fc3_response(
+        tid=struct.unpack(">H", sent["frame"][:2])[0], uid=0)
+    return sock, sent
+
+
+@patch("netscanner.select.select")
+def test_probe_records_one_frame_out_and_one_back(mock_select):
+    sock, sent = _echoing_socket(mock_select)
+    writer = _CollectingWriter()
+    channel = ProbeChannel(sock, "10.0.0.1", ScanConfig(port=502), [writer])
+
+    status, _fc, _value, _detail = _probe(channel, unit_id=0, fc=3)
+
+    assert status == STATUS_OPEN
+    assert len(writer.frames) == 2
+    assert writer.frames[0]["payload"] == sent["frame"]
+    assert writer.frames[1]["payload"][:2] == sent["frame"][:2]
+
+
+@patch("netscanner.select.select")
+def test_probe_sends_a_well_formed_modbus_request(mock_select):
+    sock, sent = _echoing_socket(mock_select)
+    channel = ProbeChannel(sock, "10.0.0.1", ScanConfig(port=502), None)
+
+    _probe(channel, unit_id=0, fc=3)
+
+    frame = sent["frame"]
     assert len(frame) == 12
-    tid, proto, length, unit = struct.unpack(">HHHB", frame[:7])
-    assert tid == 1 and proto == 0 and length == 6 and unit == 0
+    _tid, proto, length, unit = struct.unpack(">HHHB", frame[:7])
+    assert proto == 0 and length == 6 and unit == 0
     assert frame[7] == 3
 
 
 # ---------------------------------------------------------------------------
-# scan_host with ModbusPlugin — dual select patch required
+# scan_host with ModbusPlugin — one select patch
 # Decorator order: outermost @patch → last param; innermost → first param
 # @patch("netscanner.socket.socket")           → mock_socket_cls  (last)
-# @patch("plugins.modbus.select.select")       → mock_mb_select   (middle)
-# @patch("netscanner.select.select")           → mock_ns_select   (first)
+# @patch("plugins.modbus.select.select")       → mock_select   (middle)
+# @patch("netscanner.select.select")           → mock_select   (first)
 # ---------------------------------------------------------------------------
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_open_fc3(mock_ns_select, mock_mb_select, mock_socket_cls):
+def test_scan_host_open_fc3(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [
+    mock_select.side_effect = [([], [], [])] + [
         ([], [sock], []), ([sock], [], []),
         ([], [sock], []), ([sock], [], []),
     ]
@@ -278,51 +298,45 @@ def test_scan_host_timeout_connect(mock_socket_cls):
 
 @patch("netscanner.socket.socket")
 @patch("netscanner.select.select")
-def test_scan_host_closed_immediately_a14(mock_ns_select, mock_socket_cls):
+def test_scan_host_closed_immediately_a14(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
-    mock_ns_select.return_value = ([sock], [], [])
+    mock_select.return_value = ([sock], [], [])
     sock.recv.return_value = b""
     results = scan_host("10.0.0.1", ScanConfig(), ModbusPlugin())
     assert results[0].status == STATUS_CLOSED_IMMEDIATELY
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_zero_window_a15(mock_ns_select, mock_mb_select, mock_socket_cls):
+def test_scan_host_zero_window_a15(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [([], [], [])]   # write-ready empty → ZeroWindow
+    mock_select.side_effect = [([], [], [])] + [([], [], [])]   # write-ready empty → ZeroWindow
     results = scan_host("10.0.0.1", ScanConfig(), ModbusPlugin())
     assert results[0].status == STATUS_ZERO_WINDOW
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_timeout_response(mock_ns_select, mock_mb_select, mock_socket_cls):
+def test_scan_host_timeout_response(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [([], [sock], []), ([], [], [])]  # write ok, read timeout
+    mock_select.side_effect = [([], [], [])] + [([], [sock], []), ([], [], [])]  # write ok, read timeout
     results = scan_host("10.0.0.1", ScanConfig(), ModbusPlugin())
     assert results[0].status == STATUS_TIMEOUT_RESPONSE
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_exception_then_fc1_success(mock_ns_select, mock_mb_select,
+def test_scan_host_exception_then_fc1_success(mock_select,
                                                mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [
+    mock_select.side_effect = [([], [], [])] + [
         ([], [sock], []), ([sock], [], []),   # FC3
         ([], [sock], []), ([sock], [], []),   # FC1 fallback
     ]
@@ -335,28 +349,24 @@ def test_scan_host_exception_then_fc1_success(mock_ns_select, mock_mb_select,
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_no_modbus(mock_ns_select, mock_mb_select, mock_socket_cls):
+def test_scan_host_no_modbus(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [([], [sock], []), ([sock], [], [])]
+    mock_select.side_effect = [([], [], [])] + [([], [sock], []), ([sock], [], [])]
     sock.recv.return_value = b"HTTP/1.1 200 OK\r\n"
     results = scan_host("10.0.0.1", ScanConfig(), ModbusPlugin())
     assert results[0].status == STATUS_NO_MODBUS
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_open_both_units(mock_ns_select, mock_mb_select, mock_socket_cls):
+def test_scan_host_open_both_units(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [
+    mock_select.side_effect = [([], [], [])] + [
         ([], [sock], []), ([sock], [], []),
         ([], [sock], []), ([sock], [], []),
     ]
@@ -371,15 +381,13 @@ def test_scan_host_open_both_units(mock_ns_select, mock_mb_select, mock_socket_c
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_unit0_open_unit1_timeout(mock_ns_select, mock_mb_select,
+def test_scan_host_unit0_open_unit1_timeout(mock_select,
                                              mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [
+    mock_select.side_effect = [([], [], [])] + [
         ([], [sock], []), ([sock], [], []),   # unit 0 ok
         ([], [sock], []), ([], [], []),        # unit 1 write ok, read timeout
     ]
@@ -395,14 +403,12 @@ def test_scan_host_unit0_open_unit1_timeout(mock_ns_select, mock_mb_select,
 # ---------------------------------------------------------------------------
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_pcap_open(mock_ns_select, mock_mb_select, mock_socket_cls):
+def test_scan_host_pcap_open(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [
+    mock_select.side_effect = [([], [], [])] + [
         ([], [sock], []), ([sock], [], []),
         ([], [sock], []), ([sock], [], []),
     ]
@@ -434,11 +440,11 @@ def test_scan_host_pcap_open(mock_ns_select, mock_mb_select, mock_socket_cls):
 
 @patch("netscanner.socket.socket")
 @patch("netscanner.select.select")
-def test_scan_host_pcap_closed_immediately(mock_ns_select, mock_socket_cls):
+def test_scan_host_pcap_closed_immediately(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.return_value = ([sock], [], [])
+    mock_select.return_value = ([sock], [], [])
     sock.recv.return_value = b""
     with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as f:
         path = f.name
@@ -459,15 +465,13 @@ def test_scan_host_pcap_closed_immediately(mock_ns_select, mock_socket_cls):
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.modbus.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_pcap_no_modbus_econnreset(mock_ns_select, mock_mb_select,
+def test_scan_host_pcap_no_modbus_econnreset(mock_select,
                                               mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ('10.0.0.250', 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_mb_select.side_effect = [([], [sock], []), ([sock], [], [])]
+    mock_select.side_effect = [([], [], [])] + [([], [sock], []), ([sock], [], [])]
     sock.recv.side_effect = OSError(errno_mod.ECONNRESET, "Connection reset by peer")
     with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as f:
         path = f.name
