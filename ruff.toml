@@ -1,0 +1,9 @@
+# Narrow on purpose. F and E9 catch real defects — undefined names, unused
+# imports, syntax that cannot run — and B catches the bug-shaped patterns.
+# Style and modernisation rules are left off: this code targets Python 3.9,
+# and several of ruff's default UP rules would rewrite constructs whose 3.9
+# and 3.10+ behaviour differs (socket.timeout is not TimeoutError before 3.10).
+target-version = "py39"
+
+[lint]
+select = ["F", "E9", "B"]

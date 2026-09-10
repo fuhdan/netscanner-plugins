@@ -20,7 +20,7 @@ from netscanner import (
     scan_host, run_scan, format_result_line, format_summary, write_csv,
 )
 from plugins.modbus import (
-    ModbusPlugin, STATUS_NO_MODBUS, STATUS_EXCEPTION,
+    ModbusPlugin, STATUS_NO_MODBUS,
     build_modbus_request, parse_modbus_response, _probe,
 )
 import plugins.modbus as _modbus_mod
