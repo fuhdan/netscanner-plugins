@@ -5,33 +5,16 @@ import threading
 import time
 from typing import List, Optional
 
-
-class _SelectWrapper:
-    """Thin wrapper so plugins.modbus.select.select is patchable independently
-    from netscanner.select.select even though both delegate to the same stdlib."""
-
-    @staticmethod
-    def select(*args, **kwargs):
-        import select as _sel
-        return _sel.select(*args, **kwargs)
-
-
-select = _SelectWrapper()
-
 from netscanner import (
-    ProtocolPlugin, ScanResult, ScanConfig, PcapWriter,
+    ProtocolPlugin, ProbeChannel, ScanResult, ScanConfig, PcapWriter,
+    ZeroWindowError,
     STATUS_OPEN, STATUS_TIMEOUT_RESPONSE, STATUS_ZERO_WINDOW,
-    TCP_PSH_ACK, TCP_RST, TCP_FIN_ACK,
 )
 
 STATUS_NO_MODBUS = "NO_MODBUS"
 STATUS_EXCEPTION = "EXCEPTION"
 
 _thread_local = threading.local()
-
-
-class _ZeroWindowError(Exception):
-    pass
 
 
 def _next_tid() -> int:
@@ -65,32 +48,11 @@ def parse_modbus_response(data: bytes, expected_tid: int):
     return (tid, uid, fc, payload[1:], None)
 
 
-def _probe(sock: socket.socket, unit_id: int, fc: int,
-           response_timeout: float, pcap_log=None) -> tuple:
+def _probe(channel: ProbeChannel, unit_id: int, fc: int) -> tuple:
     tid = _next_tid()
     frame = build_modbus_request(tid=tid, unit_id=unit_id, fc=fc, addr=0, qty=1)
 
-    w_ready = select.select([], [sock], [], response_timeout)
-    if not w_ready[1]:
-        raise _ZeroWindowError()
-
-    t_send = time.time()
-    sock.sendall(frame)
-    if pcap_log:
-        pcap_log('send', t_send, frame)
-
-    r_ready = select.select([sock], [], [], response_timeout)
-    if not r_ready[0]:
-        raise TimeoutError("response timeout")
-
-    data = sock.recv(4096)
-    t_recv = time.time()
-    if not data:
-        raise OSError("connection closed during recv")
-    if pcap_log:
-        pcap_log('recv', t_recv, data)
-
-    parsed = parse_modbus_response(data, expected_tid=tid)
+    parsed = parse_modbus_response(channel.exchange(frame), expected_tid=tid)
     if parsed is None:
         return (STATUS_NO_MODBUS, fc, None, "invalid or mismatched response")
 
@@ -108,57 +70,35 @@ def _probe(sock: socket.socket, unit_id: int, fc: int,
     return (STATUS_OPEN, fc, value, "")
 
 
+def _elapsed_ms(start: float) -> float:
+    return round((time.monotonic() - start) * 1000, 1)
+
+
 class ModbusPlugin(ProtocolPlugin):
     name = "modbus"
     default_port = 502
 
     def probe(self, sock: socket.socket, ip: str, cfg: ScanConfig,
               pcap_writers: Optional[List[PcapWriter]]) -> List[ScanResult]:
-        local_ip = "0.0.0.0"  # nosec B104 — pcap source IP, not a socket bind
-        src_port = 0
-        if pcap_writers:
-            local_ip, src_port = sock.getsockname()
-
-        _scanner_seq = [1]
-        _device_seq  = [1]
-
-        def _pcap_log(direction: str, ts: float, raw_bytes: bytes) -> None:
-            assert pcap_writers is not None
-            if direction == 'send':
-                for _w in pcap_writers:
-                    _w.write_packet(ts, local_ip, ip, src_port, cfg.port,
-                                    TCP_PSH_ACK, _scanner_seq[0], _device_seq[0],
-                                    raw_bytes)
-                _scanner_seq[0] += len(raw_bytes)
-            else:
-                for _w in pcap_writers:
-                    _w.write_packet(ts, ip, local_ip, cfg.port, src_port,
-                                    TCP_PSH_ACK, _device_seq[0], _scanner_seq[0],
-                                    raw_bytes)
-                _device_seq[0] += len(raw_bytes)
-
-        _log = _pcap_log if pcap_writers else None
+        channel = ProbeChannel(sock, ip, cfg, pcap_writers)
         results: List[ScanResult] = []
         fallback_used = False
 
         for unit_id in [0, 1]:
             t_probe = time.monotonic()
             try:
-                status, fc_used, value, detail = _probe(
-                    sock, unit_id, 3, cfg.response_timeout, pcap_log=_log)
+                status, fc_used, value, detail = _probe(channel, unit_id, 3)
 
                 if status == STATUS_EXCEPTION:
                     try:
                         status, fc_used, value, detail = _probe(
-                            sock, unit_id, 1, cfg.response_timeout, pcap_log=_log)
+                            channel, unit_id, 1)
                         fallback_used = True
-                    except (TimeoutError, OSError, _ZeroWindowError):
+                    except (TimeoutError, OSError, ZeroWindowError):
                         pass
 
                 results.append(ScanResult(
-                    ip=ip, status=status,
-                    latency_ms=round((time.monotonic() - t_probe) * 1000, 1),
-                    detail=detail,
+                    ip=ip, status=status, latency_ms=_elapsed_ms(t_probe), detail=detail,
                     extra={
                         "unit_id": unit_id,
                         "fc": fc_used,
@@ -169,52 +109,30 @@ class ModbusPlugin(ProtocolPlugin):
                 if status != STATUS_OPEN or fallback_used:
                     break
 
-            except _ZeroWindowError:
-                if pcap_writers:
-                    t_rst = time.time()
-                    for _w in pcap_writers:
-                        _w.write_packet(t_rst, local_ip, ip, src_port, cfg.port,
-                                        TCP_RST, _scanner_seq[0], _device_seq[0])
+            except ZeroWindowError:
+                channel.note_reset()
                 results.append(ScanResult(
-                    ip=ip, status=STATUS_ZERO_WINDOW,
-                    latency_ms=round((time.monotonic() - t_probe) * 1000, 1),
+                    ip=ip, status=STATUS_ZERO_WINDOW, latency_ms=_elapsed_ms(t_probe),
                     detail="TCP ZeroWindow on send",
-                    extra={"unit_id": unit_id},
-                ))
+                    extra={"unit_id": unit_id}))
                 return results
 
             except TimeoutError:
-                if pcap_writers:
-                    t_rst = time.time()
-                    for _w in pcap_writers:
-                        _w.write_packet(t_rst, local_ip, ip, src_port, cfg.port,
-                                        TCP_RST, _scanner_seq[0], _device_seq[0])
+                channel.note_reset()
                 results.append(ScanResult(
-                    ip=ip, status=STATUS_TIMEOUT_RESPONSE,
-                    latency_ms=round((time.monotonic() - t_probe) * 1000, 1),
+                    ip=ip, status=STATUS_TIMEOUT_RESPONSE, latency_ms=_elapsed_ms(t_probe),
                     detail="no Modbus response within timeout",
-                    extra={"unit_id": unit_id},
-                ))
+                    extra={"unit_id": unit_id}))
                 return results
 
             except OSError as exc:
-                if pcap_writers:
-                    t_dev_rst = time.time()
-                    for _w in pcap_writers:
-                        _w.write_packet(t_dev_rst, ip, local_ip, cfg.port, src_port,
-                                        TCP_RST, _device_seq[0], _scanner_seq[0])
+                channel.note_reset(from_scanner=False)
                 results.append(ScanResult(
-                    ip=ip, status=STATUS_NO_MODBUS,
-                    latency_ms=round((time.monotonic() - t_probe) * 1000, 1),
-                    detail=str(exc),
-                    extra={"unit_id": unit_id},
-                ))
+                    ip=ip, status=STATUS_NO_MODBUS, latency_ms=_elapsed_ms(t_probe),
+                    detail=str(exc), extra={"unit_id": unit_id}))
                 return results
 
-        if pcap_writers and all(r.status == STATUS_OPEN for r in results):
-            t_fin = time.time()
-            for _w in pcap_writers:
-                _w.write_packet(t_fin, local_ip, ip, src_port, cfg.port,
-                                TCP_FIN_ACK, _scanner_seq[0], _device_seq[0])
+        if all(r.status == STATUS_OPEN for r in results):
+            channel.note_finished()
 
         return results

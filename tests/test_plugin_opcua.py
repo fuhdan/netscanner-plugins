@@ -220,10 +220,12 @@ def test_parse_accepts_ack_with_trailing_bytes_from_stream():
 # ---------------------------------------------------------------------------
 # Plugin behaviour via scan_host
 #
-# Dual select patch, exactly as the modbus suite does:
-#   @patch("netscanner.socket.socket")      -> mock_socket_cls (outermost/last)
-#   @patch("plugins.opcua.select.select")   -> mock_ua_select
-#   @patch("netscanner.select.select")      -> mock_ns_select  (innermost/first)
+# One select patch. The plugin talks to the socket through ProbeChannel, which
+# lives in netscanner, so netscanner.select.select serves both the framework's
+# 50 ms pre-probe peek and the channel's own send and receive. That peek is
+# always the first call, so one side_effect sequence covers both:
+#   @patch("netscanner.socket.socket")   -> mock_socket_cls (outermost/last)
+#   @patch("netscanner.select.select")   -> mock_select      (innermost/first)
 # ---------------------------------------------------------------------------
 
 import errno as errno_mod          # noqa: E402
@@ -285,14 +287,12 @@ def test_plugin_is_discovered_by_framework():
 # --- happy path ------------------------------------------------------------
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_open_on_acknowledge(mock_ns_select, mock_ua_select, mock_socket_cls):
+def test_scan_host_open_on_acknowledge(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = _ready(sock)
+    mock_select.side_effect = [([], [], [])] + _ready(sock)
     sock.recv.side_effect = [_make_ack()]
 
     results = scan_host("10.0.0.1", ScanConfig(port=4840), OpcuaPlugin())
@@ -308,15 +308,13 @@ def test_scan_host_open_on_acknowledge(mock_ns_select, mock_ua_select, mock_sock
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_hello_advertises_the_scanned_ip_and_port(mock_ns_select, mock_ua_select,
+def test_hello_advertises_the_scanned_ip_and_port(mock_select,
                                                   mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = _ready(sock)
+    mock_select.side_effect = [([], [], [])] + _ready(sock)
     sock.recv.side_effect = [_make_ack()]
 
     scan_host("10.0.0.7", ScanConfig(port=4841), OpcuaPlugin())
@@ -329,15 +327,13 @@ def test_hello_advertises_the_scanned_ip_and_port(mock_ns_select, mock_ua_select
 # --- error / rejection paths ----------------------------------------------
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_ua_error_is_a_positive_identification(mock_ns_select, mock_ua_select,
+def test_scan_host_ua_error_is_a_positive_identification(mock_select,
                                                          mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = _ready(sock)
+    mock_select.side_effect = [([], [], [])] + _ready(sock)
     sock.recv.return_value = _make_err()
 
     results = scan_host("10.0.0.1", ScanConfig(port=4840), OpcuaPlugin())
@@ -350,15 +346,13 @@ def test_scan_host_ua_error_is_a_positive_identification(mock_ns_select, mock_ua
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_no_opcua_on_http_response(mock_ns_select, mock_ua_select,
+def test_scan_host_no_opcua_on_http_response(mock_select,
                                              mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = _ready(sock)
+    mock_select.side_effect = [([], [], [])] + _ready(sock)
     sock.recv.return_value = b"HTTP/1.1 400 Bad Request\r\n\r\n"
 
     results = scan_host("10.0.0.1", ScanConfig(port=4840), OpcuaPlugin())
@@ -366,56 +360,48 @@ def test_scan_host_no_opcua_on_http_response(mock_ns_select, mock_ua_select,
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_zero_window(mock_ns_select, mock_ua_select, mock_socket_cls):
+def test_scan_host_zero_window(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = [([], [], [])]      # never write-ready
+    mock_select.side_effect = [([], [], [])] + [([], [], [])]      # never write-ready
     results = scan_host("10.0.0.1", ScanConfig(port=4840), OpcuaPlugin())
     assert results[0].status == STATUS_ZERO_WINDOW
     assert sock.sendall.called is False
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_timeout_response(mock_ns_select, mock_ua_select, mock_socket_cls):
+def test_scan_host_timeout_response(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = [([], [sock], []), ([], [], [])]
+    mock_select.side_effect = [([], [], [])] + [([], [sock], []), ([], [], [])]
     results = scan_host("10.0.0.1", ScanConfig(port=4840), OpcuaPlugin())
     assert results[0].status == STATUS_TIMEOUT_RESPONSE
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_connection_reset(mock_ns_select, mock_ua_select, mock_socket_cls):
+def test_scan_host_connection_reset(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = _ready(sock)
+    mock_select.side_effect = [([], [], [])] + _ready(sock)
     sock.recv.side_effect = OSError(errno_mod.ECONNRESET, "Connection reset by peer")
     results = scan_host("10.0.0.1", ScanConfig(port=4840), OpcuaPlugin())
     assert results[0].status == STATUS_NO_OPCUA
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_scan_host_server_closes_without_replying(mock_ns_select, mock_ua_select,
+def test_scan_host_server_closes_without_replying(mock_select,
                                                   mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = _ready(sock)
+    mock_select.side_effect = [([], [], [])] + _ready(sock)
     sock.recv.return_value = b""             # FIN after our Hello
     results = scan_host("10.0.0.1", ScanConfig(port=4840), OpcuaPlugin())
     assert results[0].status == STATUS_NO_OPCUA
@@ -443,10 +429,10 @@ def test_scan_host_timeout_connect(mock_socket_cls):
 
 @patch("netscanner.socket.socket")
 @patch("netscanner.select.select")
-def test_scan_host_closed_immediately(mock_ns_select, mock_socket_cls):
+def test_scan_host_closed_immediately(mock_select, mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
-    mock_ns_select.return_value = ([sock], [], [])
+    mock_select.return_value = ([sock], [], [])
     sock.recv.return_value = b""
     results = scan_host("10.0.0.1", ScanConfig(port=4840), OpcuaPlugin())
     assert results[0].status == STATUS_CLOSED_IMMEDIATELY
@@ -455,15 +441,13 @@ def test_scan_host_closed_immediately(mock_ns_select, mock_socket_cls):
 # --- pcap integration ------------------------------------------------------
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_pcap_open_writes_handshake_hello_and_fin(mock_ns_select, mock_ua_select,
+def test_pcap_open_writes_handshake_hello_and_fin(mock_select,
                                                   mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = _ready(sock)
+    mock_select.side_effect = [([], [], [])] + _ready(sock)
     sock.recv.side_effect = [_make_ack()]
 
     with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as f:
@@ -488,15 +472,13 @@ def test_pcap_open_writes_handshake_hello_and_fin(mock_ns_select, mock_ua_select
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_pcap_zero_window_writes_rst_and_no_fin(mock_ns_select, mock_ua_select,
+def test_pcap_zero_window_writes_rst_and_no_fin(mock_select,
                                                 mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = [([], [], [])]
+    mock_select.side_effect = [([], [], [])] + [([], [], [])]
 
     with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as f:
         path = f.name
@@ -514,15 +496,13 @@ def test_pcap_zero_window_writes_rst_and_no_fin(mock_ns_select, mock_ua_select,
 
 
 @patch("netscanner.socket.socket")
-@patch("plugins.opcua.select.select")
 @patch("netscanner.select.select")
-def test_pcap_sequence_numbers_advance_by_payload_length(mock_ns_select, mock_ua_select,
+def test_pcap_sequence_numbers_advance_by_payload_length(mock_select,
                                                          mock_socket_cls):
     sock = MagicMock()
     mock_socket_cls.return_value = sock
     sock.getsockname.return_value = ("10.0.0.250", 12345)
-    mock_ns_select.side_effect = [([], [], [])]
-    mock_ua_select.side_effect = _ready(sock)
+    mock_select.side_effect = [([], [], [])] + _ready(sock)
     sock.recv.side_effect = [_make_ack()]
 
     with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as f:

@@ -4,31 +4,14 @@ import struct
 import time
 from typing import List, Optional
 
-
-class _SelectWrapper:
-    """Thin wrapper so plugins.opcua.select.select is patchable independently
-    from netscanner.select.select even though both delegate to the same stdlib."""
-
-    @staticmethod
-    def select(*args, **kwargs):
-        import select as _sel
-        return _sel.select(*args, **kwargs)
-
-
-select = _SelectWrapper()
-
 from netscanner import (
-    ProtocolPlugin, ScanResult, ScanConfig, PcapWriter,
+    ProtocolPlugin, ProbeChannel, ScanResult, ScanConfig, PcapWriter,
+    ZeroWindowError,
     STATUS_OPEN, STATUS_TIMEOUT_RESPONSE, STATUS_ZERO_WINDOW,
-    TCP_PSH_ACK, TCP_RST, TCP_FIN_ACK,
 )
 
 STATUS_NO_OPCUA = "NO_OPCUA"
 STATUS_UA_ERROR = "UA_ERROR"
-
-
-class _ZeroWindowError(Exception):
-    pass
 
 
 # --- OPC UA Connection Protocol (UACP), OPC UA Part 6 -----------------------
@@ -162,38 +145,16 @@ def parse_ua_response(data: bytes):
     })
 
 
-def _hello_exchange(sock: socket.socket, endpoint_url: str,
-                    response_timeout: float, pcap_log=None):
+def _hello_exchange(channel: ProbeChannel, endpoint_url: str):
     """Send one Hello and classify the reply.
 
     Returns whatever parse_ua_response() makes of the server's answer, or
-    raises _ZeroWindowError / TimeoutError / OSError for the transport
-    failures the framework reports as distinct statuses.
+    raises ZeroWindowError / TimeoutError / OSError for the transport failures
+    the framework reports as distinct statuses.
     """
-    frame = build_hello_frame(endpoint_url)
-
-    w_ready = select.select([], [sock], [], response_timeout)
-    if not w_ready[1]:
-        raise _ZeroWindowError()
-
-    t_send = time.time()
-    sock.sendall(frame)
-    if pcap_log:
-        pcap_log('send', t_send, frame)
-
-    r_ready = select.select([sock], [], [], response_timeout)
-    if not r_ready[0]:
-        raise TimeoutError("response timeout")
-
     # An Error may carry a 4096-byte reason, so read past the 4096 mark.
-    data = sock.recv(8192)
-    t_recv = time.time()
-    if not data:
-        raise OSError("connection closed during recv")
-    if pcap_log:
-        pcap_log('recv', t_recv, data)
-
-    return parse_ua_response(data)
+    return parse_ua_response(channel.exchange(build_hello_frame(endpoint_url),
+                                              8192))
 
 
 class OpcuaPlugin(ProtocolPlugin):
@@ -202,42 +163,7 @@ class OpcuaPlugin(ProtocolPlugin):
 
     def probe(self, sock: socket.socket, ip: str, cfg: ScanConfig,
               pcap_writers: Optional[List[PcapWriter]]) -> List[ScanResult]:
-        local_ip = "0.0.0.0"  # nosec B104 — pcap source IP, not a socket bind
-        src_port = 0
-        if pcap_writers:
-            local_ip, src_port = sock.getsockname()
-
-        _scanner_seq = [1]
-        _device_seq  = [1]
-
-        def _pcap_log(direction: str, ts: float, raw_bytes: bytes) -> None:
-            assert pcap_writers is not None
-            if direction == 'send':
-                for _w in pcap_writers:
-                    _w.write_packet(ts, local_ip, ip, src_port, cfg.port,
-                                    TCP_PSH_ACK, _scanner_seq[0], _device_seq[0],
-                                    raw_bytes)
-                _scanner_seq[0] += len(raw_bytes)
-            else:
-                for _w in pcap_writers:
-                    _w.write_packet(ts, ip, local_ip, cfg.port, src_port,
-                                    TCP_PSH_ACK, _device_seq[0], _scanner_seq[0],
-                                    raw_bytes)
-                _device_seq[0] += len(raw_bytes)
-
-        def _rst(from_scanner: bool) -> None:
-            if not pcap_writers:
-                return
-            ts = time.time()
-            for _w in pcap_writers:
-                if from_scanner:
-                    _w.write_packet(ts, local_ip, ip, src_port, cfg.port,
-                                    TCP_RST, _scanner_seq[0], _device_seq[0])
-                else:
-                    _w.write_packet(ts, ip, local_ip, cfg.port, src_port,
-                                    TCP_RST, _device_seq[0], _scanner_seq[0])
-
-        _log = _pcap_log if pcap_writers else None
+        channel = ProbeChannel(sock, ip, cfg, pcap_writers)
         endpoint_url = "opc.tcp://{}:{}".format(ip, cfg.port)
         t_probe = time.monotonic()
 
@@ -248,20 +174,19 @@ class OpcuaPlugin(ProtocolPlugin):
         # Hello the server expects an OpenSecureChannel, and it closes the
         # connection once it has sent an Error. So there is no retry loop here.
         try:
-            parsed = _hello_exchange(sock, endpoint_url,
-                                     cfg.response_timeout, pcap_log=_log)
-        except _ZeroWindowError:
-            _rst(from_scanner=True)
+            parsed = _hello_exchange(channel, endpoint_url)
+        except ZeroWindowError:
+            channel.note_reset()
             return [ScanResult(ip=ip, status=STATUS_ZERO_WINDOW,
                                latency_ms=_elapsed(),
                                detail="TCP ZeroWindow on send")]
         except TimeoutError:
-            _rst(from_scanner=True)
+            channel.note_reset()
             return [ScanResult(ip=ip, status=STATUS_TIMEOUT_RESPONSE,
                                latency_ms=_elapsed(),
                                detail="no OPC-UA response within timeout")]
         except OSError as exc:
-            _rst(from_scanner=False)
+            channel.note_reset(from_scanner=False)
             return [ScanResult(ip=ip, status=STATUS_NO_OPCUA,
                                latency_ms=_elapsed(), detail=str(exc))]
 
@@ -275,11 +200,7 @@ class OpcuaPlugin(ProtocolPlugin):
         kind, fields = parsed
 
         if kind == "ACK":
-            if pcap_writers:
-                t_fin = time.time()
-                for _w in pcap_writers:
-                    _w.write_packet(t_fin, local_ip, ip, src_port, cfg.port,
-                                    TCP_FIN_ACK, _scanner_seq[0], _device_seq[0])
+            channel.note_finished()
             return [ScanResult(ip=ip, status=STATUS_OPEN,
                                latency_ms=latency, extra=dict(fields))]
 
