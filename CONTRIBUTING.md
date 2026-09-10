@@ -57,6 +57,19 @@ as a reference for structure and mock patterns.
 CI runs your tests against the latest netscanner by cloning it and copying
 your plugin in. If netscanner changes break your plugin, CI will catch it.
 
+## If your plugin needs something netscanner does not have yet
+
+CI here validates your plugin against netscanner's **`main`**: it clones that
+repository, copies your plugin in, and runs the whole suite. So a plugin that
+needs a framework change — a new helper on `ProbeChannel`, a new framework
+status, a change to the plugin contract — cannot go green here until that change
+is merged in netscanner.
+
+Land the framework change there first, then open the pull request here. Opening
+both at once leaves this one red for reasons that have nothing to do with your
+plugin, and re-running the checks afterwards is a manual step: GitHub does not
+notice that another repository moved.
+
 ## 4. Open a PR
 
 CI will automatically:
