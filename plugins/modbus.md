@@ -10,6 +10,15 @@ probes each host with a Read Holding Registers (FC3) request. If the device
 returns a Modbus exception, it falls back to Read Coils (FC1). Both unit IDs
 0 and 1 are tested independently — many devices respond on one but not the other.
 
+## Installation
+
+None. Merged plugins are synced into netscanner, so a current netscanner
+checkout already has this plugin. Verify with:
+
+```bash
+python3 netscanner.py --list-protocols
+```
+
 ## Usage
 
 ```bash
@@ -42,9 +51,19 @@ python3 netscanner.py 10.0.0.1 --protocol modbus --port 502
 [10.0.0.4]    REFUSED                                           1ms
 ```
 
+## Requirements
+
+- Python 3.9+
+- netscanner (any version)
+- No other dependencies — standard library only
+
 ## Known limitations
 
 - Only probes unit IDs 0 and 1. Devices configured for other unit IDs will not respond.
 - Reads one register/coil at address 0 only.
 - Does not support Modbus RTU over TCP.
 - ZeroWindow from some devices (notably Siemens S7) is detected and reported — include the pcap if you see unexpected results.
+
+## Licence
+
+Apache-2.0, as part of netscanner-plugins.

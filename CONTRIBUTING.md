@@ -11,9 +11,9 @@ plugins/yourprotocol.md     ← documentation (required)
 tests/test_plugin_yourprotocol.py
 ```
 
-When your PR is merged here, a pipeline automatically syncs the plugin into
-[netscanner](https://github.com/fuhdan/netscanner). Users get it on the next
-`git pull` — no separate installation step.
+When your PR is merged here, a pipeline validates the plugin once more and
+opens a pull request on [netscanner](https://github.com/fuhdan/netscanner).
+Users get it on the next `git pull` — no separate installation step.
 
 ---
 
@@ -61,6 +61,7 @@ your plugin in. If netscanner changes break your plugin, CI will catch it.
 
 CI will automatically:
 - Run `bandit` security scan on `plugins/`
+- Run `ruff check` on `plugins/` and `tests/` (config in `ruff.toml`)
 - Clone netscanner and install your plugin
 - Verify the plugin is discovered by `--list-protocols`
 - Run the full test suite on Python 3.9, 3.11, and 3.12
@@ -84,5 +85,22 @@ Use the exact comment shown so the intent is clear to reviewers.
 
 ## After merge
 
-A pipeline opens a PR on netscanner with your plugin files. It auto-merges
-once netscanner's CI passes. No action needed from you.
+A pipeline re-runs the security scan, the discovery check and the full test
+suite, then opens a pull request on netscanner containing your plugin files and
+a link back to the commit here. That pull request runs netscanner's own CI and
+is queued for auto-merge: it lands as soon as a netscanner maintainer approves
+it and the checks are green. Nothing further is needed from you.
+
+Because this repository is the single source of truth for plugins, the sync
+mirrors rather than copies: a plugin removed or renamed here is removed there
+too, in the same reviewed pull request.
+
+---
+
+## Licensing
+
+This repository is licensed under Apache-2.0. By opening a pull request you
+submit your contribution under that same licence — plugins merged here are
+copied into netscanner and shipped inside its release archives, so a plugin
+under a different licence cannot be carried along. Do not add a separate licence
+header or file to a plugin.
